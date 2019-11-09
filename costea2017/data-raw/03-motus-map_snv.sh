@@ -7,14 +7,13 @@ set -euo pipefail
 # to a cluster with sbatch, also adjust in "SBATCH -c N" above
 nproc=4
 
-# Set paths based on the DATA_PATH set in the .env file
-export $(cat .env | xargs)
-reads_path=$DATA_PATH/costea2017/reads
-out_path=$DATA_PATH/costea2017/motus/bam
-
-# The ERA run accession, used to create the fastq.gz file names; read in as
-# command line arg
-accession=$1
+# Command-line args:
+# Path with the reads
+reads_path=$1
+# Path for bam output 
+out_path=$2
+# The ERA run accession, used to create the fastq.gz file names
+accession=$3
 
 # Activate conda environment with motus. Must be edited based on system
 # configuration
