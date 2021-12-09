@@ -2,12 +2,12 @@
 
 library(tidyverse)
 library(here)
-library(dotenv)
+# library(dotenv)
 
 ## Setup
 
 # Load .env file
-load_dot_env(here(".env"))
+dotenv::load_dot_env(here(".env"))
 # Directory for downloading project data
 data_path <- Sys.getenv("DATA_PATH")
 # Paths to the aspera connect `ascp` program and the private key file to be

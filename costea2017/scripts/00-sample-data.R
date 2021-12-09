@@ -2,7 +2,11 @@
 
 library(tidyverse)
 library(here)
-library(dotenv)
+# Also used:
+# readxl
+# dotenv
+
+dotenv::load_dot_env(here(".env"))
 
 # Location for downloading files and storing intermediate files. Create a
 # symlink if want to store large data (the sequence reads) in a different
@@ -25,12 +29,13 @@ urls <- c("https://media.nature.com/original/nature-assets/nbt/journal/v35/n11/e
 names(urls) <- c("mock_composition.xlsx", "sample_description.xlsx")
 fns <- file.path(dl_path, names(urls))
 walk2(urls, fns, download.file)
-list.files(dl_path)
 
 ## Sequence file metadata from the ENA
 # https://www.ebi.ac.uk/ena/data/view/PRJEB14847
 fn <- file.path(dl_path, "PRJEB14847.tsv")
 download.file("https://www.ebi.ac.uk/ena/data/warehouse/filereport?accession=PRJEB14847&result=read_run&download=txt", fn)
+
+list.files(dl_path)
 
 #  Mock community composition -------------------------------------------------
 mock <- readxl::read_xlsx(file.path(dl_path, "mock_composition.xlsx"), 
@@ -41,26 +46,328 @@ mock <- readxl::read_xlsx(file.path(dl_path, "mock_composition.xlsx"),
     select(-`NCBI tax ID`)
 head(mock)
 costea2017_mock_composition <- mock
-# usethis::use_data(costea2017_mock_composition)
 # TODO: save this somewhere
 
-# Link sample metadata to sequence data ---------------------------------------
-
-seqtb <- readr::read_tsv(file.path(dl_path, "PRJEB14847.tsv"))
+# Sample metadata from the manuscript supplementary files ---------------------
 
 # The metadata for the three experimental phases of the Costea2017 experiment
 # is given on a single sheet in separate rectagular ranges.
 fn <- file.path(dl_path, "sample_description.xlsx")
 ranges <- c("1" = "A3:B192", "2" = "D3:F77", "3" = "H3:J32")
 sam.all <- map_dfr(ranges, ~readxl::read_xlsx(fn, range = .),
-    .id = "Phase")
+    .id = "phase") %>%
+    rename_all(str_to_lower) %>%
+    rename(si_sample = sample) %>%
+    mutate(
+        individual = case_when(
+            phase == 3 ~ individual,
+            TRUE ~ str_sub(si_sample, 1, 1)
+            )
+        ) %>%
+    mutate_at(vars(phase, lab, protocol, individual), as.factor)
 sam.all %>%
-    group_by(Phase) %>%
+    group_by(phase) %>%
     count
-# Keep copy of the sample names used in the SI spreadsheet so that we can
-# change the sample names later
-sam.all <- sam.all %>% 
-    mutate(SI_sample = Sample)
+
+# Link sample metadata to sequence data ---------------------------------------
+
+# We have to use the tsv from the ENA to link the SI sample names to the ENA
+# accessions
+seqtb <- readr::read_tsv(file.path(dl_path, "PRJEB14847.tsv")) %>%
+    select_if(~length(unique(.)) > 1) %>%
+    select(-starts_with("sra"), -starts_with("fastq"), 
+        -starts_with("submitted"))
+
+
+# Note, there are a number of samples with multiple runs
+seqtb %>%
+    group_by(sample_accession) %>%
+    count %>%
+    filter(n>1)
+
+a1 <- seqtb %>%
+    group_by(sample_accession) %>%
+    mutate(n = n()) %>%
+    filter(n>1) %>%
+    arrange(sample_accession, run_accession)
+
+# GOAL: get the sample_accession matched to si_sample
+
+
+# Sample names grouped by phase
+si_sns <- sam.all %>%
+    select(phase, si_sample) %>%
+    group_by(phase) %>%
+    nest %>%
+    deframe %>%
+    map(pull)
+
+# si_sns$`1`
+# si_sns$`2`
+
+
+
+# The phase 3 si_sample can be found in: 
+# library_name, experiment_alias, run_alias
+# and has the pattern "BYQ_[A-Z]{4}"
+# The phase 2 si_sample can be found at the end of the sample_alias col and has
+# the pattern "(A|B)1_[0-9]{3}$"
+
+tb <- seqtb %>%
+    select(sample_accession, library_name, experiment_alias, run_alias,
+        sample_alias) %>%
+    mutate_all(str_replace_all, "[_ -]+", "_") %>%
+    mutate(
+        phase2_name = str_extract(sample_alias, "(A|B)1_[0-9]{3}$"),
+        phase3_name = str_extract(library_name, "BYQ_[A-Z]{4}")
+        ) %>%
+    # Get the si sample name iff only one of the phase 2 or 3 names exists
+    filter(!(is.na(phase2_name) & is.na(phase3_name))) %>%
+    mutate(si_sample = case_when(
+            !is.na(phase2_name) & is.na(phase3_name) ~ phase2_name,
+            is.na(phase2_name) & !is.na(phase3_name) ~ phase3_name,
+            TRUE ~ NA_character_
+            )
+        ) %>%
+    select(sample_accession, si_sample) %>%
+    # Remove duplicates
+    distinct %>%
+    # join with the sample data
+    left_join(sam.all, by = "si_sample") %>%
+    # Drop the remaining Phase 1 samples
+    filter(phase %in% c("2", "3"))
+
+# Are all phase 2 and 3 samples represented?
+sam.all %>%
+    filter(phase != 1) %>%
+    pull(si_sample) %>%
+    {all(. %in% tb$si_sample)}
+
+# Check for multiple sample accessions per si_sample
+
+tb %>%
+    group_by(phase) %>%
+    count
+
+tb %>%
+    group_by(phase, si_sample) %>%
+    count %>%
+    filter(n > 1)
+
+tb %>%
+    filter(is.na(phase))
+
+# SAMEA4347651	B1_062	2	1	Q	B
+
+a2 <- seqtb %>%
+    # select(sample_accession, library_name, experiment_alias, run_alias,
+    #     sample_alias) %>%
+    mutate_all(str_replace_all, "[_ -]+", "_") %>%
+    mutate(
+        phase2_name = str_extract(sample_alias, "(A|B)1_[0-9]{3}$"),
+        phase3_name = str_extract(library_name, "BYQ_[A-Z]{4}")
+        ) %>%
+    filter(phase2_name == "B1_062")
+    
+a4 <- seqtb %>%
+    arrange(sample_alias) %>%
+    group_by(sample_alias) %>%
+    mutate(n = n()) %>%
+    filter(n > 1)
+
+# Oh. One of these is a phase 1 sample, B1_062_FNOSW .
+# I have to reexamine my original method, and make sure I discard the phase 1
+# samples 
+
+
+# Q: how to distinguish phase 2 from phase 1?
+
+# All of the library substrings for phase 1 have 5 characters
+phase1_substrings <- sam.all %>%
+    filter(phase == 1) %>%
+    mutate(library_substring = str_extract(si_sample, "[A-Z]{4,6}$")) %>%
+    pull(library_substring)
+phase1_substrings %>%
+    map_int(nchar) %>%
+    summary
+# The NA corresponds to a typo of 1 instead of I
+
+# Get info from the library_name and sample_alias that can be used to filter
+# out the "C" samples and the phase 1 samples, and get the si_sample name for
+# phase 2 and phase 3 samples
+# which phase
+tb <- seqtb %>%
+    select(sample_accession, library_name, sample_alias) %>%
+    mutate_all(str_replace_all, "[_ -]+", "_") %>%
+    mutate(
+        library_substring = str_extract(library_name, 
+            "(?<=AWF_)[A-Z]{4,}(?=_r)"),
+        individual = str_extract(sample_alias, "(?<=_)(A|B|C)(?=(1|2)(_|$))"),
+        phase2_name = str_extract(sample_alias, "(A|B)1_[0-9]{3}$"),
+        phase3_name = str_extract(library_name, "BYQ_[A-Z]{4}")
+        )
+tb0 <- tb %>%
+    # Remove Individual C samples
+    filter((individual != "C") | is.na(individual)) %>%
+    # Remove Phase 1 samples; necessary to avoid cross-matching with phase 2
+    # names in sam.all
+    filter(!(library_substring %in% phase1_substrings)) %>%
+    # Pick the sample name via the phase2 or phase3 form
+    mutate(si_sample = case_when(
+            !is.na(phase2_name) & is.na(phase3_name) ~ phase2_name,
+            is.na(phase2_name) & !is.na(phase3_name) ~ phase3_name,
+            TRUE ~ NA_character_
+            )
+        ) %>%
+    select(sample_accession, si_sample) %>%
+    # Remove duplicates (check later)
+    distinct %>%
+    # join with the sample data
+    left_join(sam.all, by = "si_sample")
+tb0$si_sample %>% is.na %>% any
+#> [1] FALSE
+
+# Note, we have a 1-1 correspondence between sample accesions and si samples.
+# but there can be multiple runs per sample.
+
+# Ok, I think that tb0 is a trustworthy map from sample_accession to si_sample
+# for phase 2 and 3 samples. (For phase 1 samples, more care is needed, and
+# would have to fix the putative typos)
+
+# Next: 
+# - Call tb0 something sensible
+# - compare tb0 w/ seqtb to see what's up with cases where multiple runs per
+# si_sample // sample_accession
+
+# One row per run, with relevant info
+runtb <- seqtb %>%
+    select(run_accession, sample_accession, instrument_model, nominal_length,
+        library_layout, read_count, base_count, ) %>%
+    left_join(tb0, by = "sample_accession") %>%
+    filter(!is.na(phase)) %>%
+    arrange(phase, lab, individual, protocol, sample_accession) %>%
+    group_by(si_sample) %>%
+    mutate(n = n()) %>%
+    ungroup
+
+# Duplicates - 
+dups <- runtb %>%
+    filter(n>1)
+
+# Any difference in insert size or read count?
+runtb %>%
+    group_by(n, sample_accession) %>%
+    summarize_at(vars(nominal_length, read_count), min) %>%
+    summarize_at(vars(nominal_length, read_count), mean)
+# In cases where there are two runs, the read counts tend to be lower; perhaps
+# these samples were resequenced after the initial read count was found to be
+# low?
+
+
+# TODO: save runtb. Either use this for the metadata for the motus2
+# output, or re-run motus on the duplicate samples with all the sequence data.
+
+# revise the above; explain the reasoning
+
+write_csv(runtb, here("costea2017", "data", "costea2017-run-metadata.csv"))
+saveRDS(runtb, here("costea2017", "data", "costea2017-run-metadata.Rds"))
+
+# OLD ----------
+
+
+
+# Note, we expect 189 samples for phase 1 and 74 samples for phase 2,
+# indicating extra samples or duplicate samples.
+
+dups <- seqtb %>%
+    filter(duplicated(SI_sample) | 
+            duplicated(SI_sample, fromLast = TRUE)
+        ) %>%
+    arrange(Phase, SI_sample, run_accession)
+# The library_name and sample_alias are duplicated; while the run_alias and
+# run_accessions differ
+dups %>%
+    select(Phase, SI_sample, library_name, sample_alias) %>%
+    group_by(Phase) %>%
+    top_n(4, SI_sample)
+dups %>%
+    select(Phase, SI_sample, run_accession, run_alias) %>%
+    group_by(Phase) %>%
+    top_n(4, SI_sample)
+# (Differences appear in the HAYK8ADXX part of the run alias)
+# For Phase 1, there can be differences in library layout and length
+dups %>%
+    select(Phase, SI_sample, library_layout, nominal_length) %>%
+    group_by(Phase) %>%
+    top_n(4, SI_sample)
+
+# Unclear why there are multiple libraries for these samples.
+
+# Create final sample metadata table ------------------------------------------
+
+# Let's get sample data for just Phases 2 and 3
+
+# Get a minimal set of variables for joining with the sample metadata
+seqtb0 <- seqtb %>%
+    select(SI_sample, Phase, run_accession, 
+        instrument_model, library_layout, nominal_length) %>%
+    rename_at(vars(-SI_sample), str_to_sentence)
+        # library_name, run_alias,
+        # fastq_bytes, fastq_md5, fastq_ftp, fastq_aspera)
+
+# Once we join with the sample data, we will have multiple rows for the
+# SI_sample that are duplicated in the seqtb.
+sam <- sam.all %>%
+    filter(Phase %in% c(2, 3)) %>%
+    left_join(seqtb0, by = c("Phase", "SI_sample")) %>%
+    arrange(Phase, SI_sample, Run_accession) %>%
+    group_by(SI_sample) %>%
+    mutate(
+        id = rank(Run_accession),
+        n = n(),
+        Sample = ifelse(n > 1,
+            paste(SI_sample, id, sep = "_"), 
+            SI_sample),
+        ) %>%
+    select(Sample, Phase, everything())
+
+sam %>%
+    # filter(duplicated(SI_sample) | duplicated(SI_sample, fromLast = TRUE)) %>%
+    filter(n > 1) %>%
+    select(Phase, Sample, SI_sample, Run_accession, id, n)
+
+sam <- sam %>%
+    mutate(
+        Individual = case_when(
+            Phase == 2 ~ str_sub(SI_sample, 1, 1),
+            Phase == 3 ~ Individual),
+        Sample = case_when(
+            # Phase == 2 ~ paste0("Ph2", "L", Lab, Protocol, Individual),
+            Phase == 2 ~ Sample,
+            Phase == 3 ~ paste0(Protocol, Individual))
+        )
+
+write_csv(sam, here("costea2017", "data", "costea2017-phases23-sample-data.csv"))
+
+
+
+
+####################### OLD below here; should save ####################
+
+
+
+
+
+
+
+# Link sample metadata to sequence data ---------------------------------------
+
+# We have to use the tsv from the ENA to link the SI sample names to the ENA
+# accessions
+seqtb <- readr::read_tsv(file.path(dl_path, "PRJEB14847.tsv")) %>%
+    select_if(~length(unique(.)) > 1) %>%
+    select(-starts_with("sra"), -starts_with("fastq"), 
+        -starts_with("submitted"))
 
 # There are a few strings for each run that will help us in matching with the
 # metadata
@@ -190,6 +497,7 @@ dups %>%
 
 # Unclear why there are multiple libraries for these samples.
 
+# Create final sample metadata table ------------------------------------------
 
 # Let's get sample data for just Phases 2 and 3
 
@@ -235,59 +543,3 @@ sam <- sam %>%
 
 write_csv(sam, here("costea2017", "data", "costea2017-phases23-sample-data.csv"))
 
-# Download reads from the ENA for Phase 2 and Phase 3 -------------------------
-
-## Setup
-
-# Load .env file
-dotenv::load_dot_env(here("data-raw", ".env"))
-# Directory to download reads to
-Sys.getenv("DATA_PATH")
-# Paths to the aspera connect `ascp` program and the private key file to be
-# used with the -i option
-Sys.getenv("ASPERA_ASCP")
-Sys.getenv("ASPERA_KEY")
-
-# TODO: consider putting all the intermediate files into DATA_PATH as well
-
-reads_path <- file.path(Sys.getenv("DATA_PATH"), "costea2017", "reads")
-if (!dir.exists(reads_path)) {
-    dir.create(reads_path)
-}
-
-## Download with ascp (aspera connect command line tool)
-# If don't have aspera, can download with wget (see below).
-# The aspera urls are in the format "url/for/read1;url/for/read2" in `seqtb`
-# and so we first split all out into a single list
-# aspera_urls <- seqtb$fastq_aspera %>% str_split(";", simplify=TRUE) %>% c
-aspera_urls <- seqtb %>%
-    filter(Phase %in% c(2, 3)) %>%
-    .$fastq_aspera %>% 
-    str_split(";", simplify=TRUE) %>%
-    c
-commands <- paste(
-    Sys.getenv("ASPERA_ASCP"),
-    "-QT -l 300m -P33001 -i", 
-    Sys.getenv("ASPERA_KEY"),
-    paste0("era-fasp@", aspera_urls),
-    reads_path
-    )
-walk(commands, system)
-
-# ## Alternately, download with wget:
-# ftp_urls <- seqtb$fastq_ftp %>% str_split(";", simplify=TRUE) %>% c
-# dir.create(file.path(data_path, "reads"), recursive = TRUE)
-# commands <- paste("wget", "-P", file.path(data_path, "reads"), 
-#     paste0("ftp://", ftp_urls)
-# walk(commands, system)
-
-## Check dowloaded files against md5sums
-downloads <- aspera_urls %>% 
-    str_extract("ERR[0-9]*_[1-2]\\.fastq\\.gz") %>%
-    file.path(reads_path, .)
-md5sums_expected <- seqtb$fastq_md5 %>% str_split(";", simplify=TRUE) %>% c
-md5sums_actual <- tools::md5sum(downloads)
-# Fraction of files that were successfully downloaded and gave an md5
-mean(!is.na(md5sums_actual))
-# Check that the downloaded files match the expected md5
-all(md5sums_expected == md5sums_actual, na.rm = TRUE)
